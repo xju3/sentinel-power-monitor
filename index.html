@@ -167,8 +167,8 @@
     <div class="metric-value purple" id="val-power">--<span>mW</span></div>
   </div>
   <div class="metric">
-    <div class="metric-label">采集周期平均电流</div>
-    <div class="metric-value blue" id="val-avg30">--<span>mA</span></div>
+    <div class="metric-label">全程平均功率</div>
+    <div class="metric-value amber" id="r-avg-power">--<span>mW</span></div>
   </div>
   <div class="metric">
     <div class="metric-label">峰值电流</div>
@@ -231,22 +231,27 @@
 
   <div class="result-grid">
     <div class="result-card">
-      <div class="r-label">全程平均功率</div>
-      <div class="r-value amber" id="r-avg-power">--<span>mW</span></div>
-      <div class="r-sub" id="r-avg-current-sub">--</div>
+      <div class="r-label" id="r-label-cycle-avg">采集周期平均电流</div>
+      <div class="r-value blue" id="r-cycle-avg-current">--<span>mA</span></div>
+      <div class="r-sub">完整周期统计</div>
     </div>
     <div class="result-card">
-      <div class="r-label">单次采集平均功耗</div>
+      <div class="r-label" id="r-label-sample-power">单次采集平均功耗</div>
       <div class="r-value amber" id="r-sample-power">--<span>mWh</span></div>
       <div class="r-sub" id="r-sample-power-sub">--</div>
     </div>
     <div class="result-card">
-      <div class="r-label">当前周期支持次数</div>
+      <div class="r-label" id="r-label-sample-time">单次采集平均时间</div>
+      <div class="r-value blue" id="r-sample-active-time">--<span>s</span></div>
+      <div class="r-sub" id="r-sample-duration-sub">--</div>
+    </div>
+    <div class="result-card">
+      <div class="r-label" id="r-label-total-cycles">当前周期支持次数</div>
       <div class="r-value blue" id="r-total-cycles">--<span>次</span></div>
       <div class="r-sub" id="r-cycles-sub">--</div>
     </div>
     <div class="result-card">
-      <div class="r-label">目标周期续航</div>
+      <div class="r-label" id="r-label-target-life">目标周期续航</div>
       <div class="r-value green" id="r-target-life">--</div>
       <div class="r-sub" id="r-target-sub">--</div>
     </div>
@@ -256,7 +261,7 @@
 <div class="controls">
   <label class="ctrl" for="window-cycles">显示窗口</label>
   <div class="input-row" style="align-items:center; gap:8px;">
-    <input type="number" id="window-cycles" value="10" step="1" min="1" style="width:80px;">
+    <input type="number" id="window-cycles" value="1" step="1" min="1" style="width:80px;">
     <span class="unit">采集周期</span>
   </div>
   <button onclick="toggleFullScreen()" id="fs-btn">全屏</button>
@@ -268,15 +273,22 @@
 <script>
 const VOLTAGE      = 3.3;
 const EFFICIENCY   = 0.85;
-const WS_URL       = 'ws://localhost:8765';
+const WS_URL       = `ws://${window.location.hostname || 'localhost'}:8765`;
 const SAMPLE_INTERVAL_MS = 200;
 const MAX_POINTS   = 20000;
+const SAMPLING_CURRENT_THRESHOLD = 1.0; // mA
 
 let data = [];
+let cycleData = [];
+let cycleMetrics = null;
+let chartYMax = 100;
 let peakCurrent = 0;
 let valleyCurrent = Number.POSITIVE_INFINITY;
-let windowCycles = 10;
+let windowCycles = 1;
 let ws = null;
+let lastChartUpdate = 0;
+let cycleNumber = 0; // 当前周期编号
+const CHART_UPDATE_INTERVAL = 100; // 100ms 更流畅的更新频率
 
 // ── Chart ─────────────────────────────────────────────────────────────────
 const chartCurrent = new Chart(document.getElementById('chart-current'), {
@@ -319,6 +331,10 @@ function timeLabel(ts) {
 
 // ── 更新曲线 ───────────────────────────────────────────────────────────────
 function updateChart() {
+  const now = Date.now();
+  if (now - lastChartUpdate < CHART_UPDATE_INTERVAL) return;
+  lastChartUpdate = now;
+
   if (!data.length) {
     chartCurrent.data.labels = [];
     chartCurrent.data.datasets[0].data = [];
@@ -328,7 +344,7 @@ function updateChart() {
   }
 
   const tCycleCurrent = parseFloat(document.getElementById('t-cycle-current').value) || 0;
-  windowCycles = parseInt(document.getElementById('window-cycles').value, 10) || 10;
+  windowCycles = parseInt(document.getElementById('window-cycles').value, 10) || 1;
   const cyclePointCount = tCycleCurrent > 0
     ? Math.max(1, Math.round(tCycleCurrent * 1000 / SAMPLE_INTERVAL_MS))
     : 1;
@@ -344,14 +360,100 @@ function updateChart() {
     return slice.reduce((sum, item) => sum + item.current, 0) / slice.length;
   });
 
-  const historyMax = data.length ? Math.max(...data.map(d => Math.abs(d.current))) : 0;
-  chartCurrent.options.scales.y.max = Math.max(10, Math.ceil(historyMax / 10) * 10);
+  chartCurrent.options.scales.y.max = chartYMax;
   chartCurrent.options.scales.y.min = 0;
 
   chartCurrent.update('none');
 }
 
 // ── 更新实时指标 ───────────────────────────────────────────────────────────
+function getCurrentCycleValue() {
+  return parseFloat(document.getElementById('t-cycle-current').value) || 0;
+}
+
+function getCyclePointCount() {
+  const currentCycleSec = getCurrentCycleValue();
+  return currentCycleSec > 0
+    ? Math.max(1, Math.round(currentCycleSec * 1000 / SAMPLE_INTERVAL_MS))
+    : 1;
+}
+
+function getCurrentCycleAverage(cycleData) {
+  if (!cycleData || !cycleData.length) return null;
+  return cycleData.reduce((sum, item) => sum + Math.abs(item.current), 0) / cycleData.length;
+}
+
+function getCurrentCycleActiveTime(cycleData) {
+  if (!cycleData || !cycleData.length) return null;
+  
+  // 找出第一个 ≥1mA 的位置
+  let firstActiveIdx = -1;
+  for (let i = 0; i < cycleData.length; i++) {
+    if (Math.abs(cycleData[i].current) >= SAMPLING_CURRENT_THRESHOLD) {
+      firstActiveIdx = i;
+      break;
+    }
+  }
+  
+  // 如果没有找到活跃段
+  if (firstActiveIdx === -1) return 0;
+  
+  // 找出最后一个 ≥1mA 的位置
+  let lastActiveIdx = -1;
+  for (let i = cycleData.length - 1; i >= 0; i--) {
+    if (Math.abs(cycleData[i].current) >= SAMPLING_CURRENT_THRESHOLD) {
+      lastActiveIdx = i;
+      break;
+    }
+  }
+  
+  // 计算从第一个到最后一个活跃点的时间
+  const activeTimeMs = (lastActiveIdx - firstActiveIdx) * SAMPLE_INTERVAL_MS;
+  return activeTimeMs / 1000; // 转换为秒
+}
+
+function completeCycle(currentCycle, completedCycleData) {
+  cycleNumber++; // 增加周期计数
+  const cycleAvg = getCurrentCycleAverage(completedCycleData);
+  const cycleActiveTime = getCurrentCycleActiveTime(completedCycleData);
+  const avgPower = cycleAvg * VOLTAGE; // mW
+  const singleCycleEnergy = avgPower * currentCycle / 3600; // mWh
+  const battery = parseFloat(document.getElementById('battery').value) || 0;
+  const batteryEnergy = battery * VOLTAGE * EFFICIENCY; // mWh
+  const currentSupportCount = singleCycleEnergy > 0
+    ? Math.floor(batteryEnergy / singleCycleEnergy)
+    : 0;
+  const totalTargetHours = currentSupportCount * parseFloat(document.getElementById('t-cycle-target').value || 0) / 3600;
+
+  cycleMetrics = {
+    avgCurrent: cycleAvg,
+    singleCycleEnergy,
+    activeTime: cycleActiveTime,
+    currentSupportCount,
+    totalTargetHours
+  };
+
+  // 更新标签(包含周期数)
+  document.getElementById('r-label-cycle-avg').textContent = `采集周期平均电流(${cycleNumber})`;
+  document.getElementById('r-label-sample-power').textContent = `单次采集平均功耗(${cycleNumber})`;
+  document.getElementById('r-label-sample-time').textContent = `单次采集平均时间(${cycleNumber})`;
+  document.getElementById('r-label-total-cycles').textContent = `当前周期支持次数(${cycleNumber})`;
+  document.getElementById('r-label-target-life').textContent = `目标周期续航(${cycleNumber})`;
+
+  document.getElementById('r-cycle-avg-current').innerHTML = `${cycleAvg.toFixed(2)}<span>mA</span>`;
+  document.getElementById('r-sample-power').innerHTML = singleCycleEnergy >= 1
+    ? `${singleCycleEnergy.toFixed(3)} mWh`
+    : `${(singleCycleEnergy * 1000).toFixed(2)} μWh`;
+  document.getElementById('r-sample-power-sub').textContent = `单次采集能耗(${cycleNumber})`;
+  document.getElementById('r-sample-active-time').innerHTML = `${cycleActiveTime.toFixed(2)}<span>s</span>`;
+  document.getElementById('r-sample-duration-sub').textContent = `周期工作时长(${cycleNumber})`;
+  document.getElementById('r-total-cycles').innerHTML = `${currentSupportCount.toLocaleString()}<span>次</span>`;
+  document.getElementById('r-cycles-sub').textContent = `支持次数(${cycleNumber})`;
+  document.getElementById('r-target-life').innerHTML = formatBatteryLife(totalTargetHours);
+  document.getElementById('r-target-sub').textContent = `续航时间(${cycleNumber})`;
+  calcBattery(cycleMetrics);
+}
+
 function updateMetrics(pt) {
   const el = document.getElementById('val-current');
   el.className = 'metric-value ' + (pt.current >= 0 ? 'green' : 'red');
@@ -363,25 +465,27 @@ function updateMetrics(pt) {
   if (absCurrent > peakCurrent) {
     peakCurrent = absCurrent;
     document.getElementById('val-peak').innerHTML = `${peakCurrent.toFixed(2)}<span>mA</span>`;
+    chartYMax = Math.max(10, Math.ceil(peakCurrent / 10) * 10);
   }
   if (absCurrent < valleyCurrent) {
     valleyCurrent = absCurrent;
     document.getElementById('val-valley').innerHTML = `${valleyCurrent.toFixed(2)}<span>mA</span>`;
   }
 
-  // 采集周期平均电流
-  const currentCycleSec = parseFloat(document.getElementById('t-cycle-current').value) || 0;
-  if (currentCycleSec > 0) {
-    const windowMs = currentCycleSec * 1000;
-    const baseTs = pt.ts;
-    const cycleWindow = data.filter(d => d.ts >= baseTs - windowMs);
-    if (cycleWindow.length > 0) {
-      const avg = cycleWindow.reduce((s, d) => s + Math.abs(d.current), 0) / cycleWindow.length;
-      document.getElementById('val-avg30').innerHTML = `${avg.toFixed(2)}<span>mA</span>`;
-    }
-  }
+  const n = data.length;
+  const totalCurrent = data.reduce((s, d) => s + Math.abs(d.current), 0);
+  const avgRunCurrent = n > 0 ? totalCurrent / n : 0;
+  const avgRunPower = avgRunCurrent * VOLTAGE;
+  document.getElementById('r-avg-power').innerHTML = `${avgRunPower.toFixed(2)}<span>mW</span>`;
+  document.getElementById('r-avg-display').textContent = `${avgRunCurrent.toFixed(3)} mA`;
 
-  calcBattery();
+  const cyclePointCount = getCyclePointCount();
+  const currentCycle = getCurrentCycleValue();
+  cycleData.push(pt);
+  if (cycleData.length >= cyclePointCount) {
+    completeCycle(currentCycle, cycleData.slice(0, cyclePointCount));
+    cycleData = cycleData.slice(cyclePointCount);
+  }
 }
 
 function formatBatteryLife(hours) {
@@ -391,7 +495,29 @@ function formatBatteryLife(hours) {
 }
 
 // ── 续航计算（全程实测均值）─────────────────────────────────────────────────
-function calcBattery() {
+function resetCycleStats() {
+  cycleData = [];
+  cycleMetrics = null;
+  cycleNumber = 0; // 重置周期计数
+  // 重置标签
+  document.getElementById('r-label-cycle-avg').textContent = `采集周期平均电流`;
+  document.getElementById('r-label-sample-power').textContent = `单次采集平均功耗`;
+  document.getElementById('r-label-sample-time').textContent = `单次采集平均时间`;
+  document.getElementById('r-label-total-cycles').textContent = `当前周期支持次数`;
+  document.getElementById('r-label-target-life').textContent = `目标周期续航`;
+  
+  document.getElementById('r-cycle-avg-current').innerHTML = `--<span>mA</span>`;
+  document.getElementById('r-sample-power').innerHTML = `--<span>mWh</span>`;
+  document.getElementById('r-sample-power-sub').textContent = `等待完整采集周期后更新`;
+  document.getElementById('r-sample-active-time').innerHTML = `--<span>s</span>`;
+  document.getElementById('r-sample-duration-sub').textContent = `等待完整采集周期后更新`;
+  document.getElementById('r-total-cycles').innerHTML = `--<span>次</span>`;
+  document.getElementById('r-cycles-sub').textContent = `等待完整采集周期后更新`;
+  document.getElementById('r-target-life').innerHTML = `--`;
+  document.getElementById('r-target-sub').textContent = `等待完整采集周期后更新`;
+}
+
+function calcBattery(cycleMetrics = null) {
   const battery       = parseFloat(document.getElementById('battery').value)    || 0;
   const tCycleCurrent = parseFloat(document.getElementById('t-cycle-current').value) || 0;
   const tCycleTarget  = parseFloat(document.getElementById('t-cycle-target').value)  || 0;
@@ -400,66 +526,96 @@ function calcBattery() {
   document.getElementById('r-sample-count').textContent = n;
   document.getElementById('r-sample-duration').textContent = (n * 0.2).toFixed(0);
 
-  if (n === 0 || battery <= 0 || tCycleCurrent <= 0 || tCycleTarget <= 0) return;
+  if (n === 0 || battery <= 0 || tCycleCurrent <= 0 || tCycleTarget <= 0) {
+    return;
+  }
 
-  const avgCurrent = data.reduce((s, d) => s + Math.abs(d.current), 0) / n;  // mA
-  const avgPower   = avgCurrent * VOLTAGE;  // mW
-  const totalHoursActual = (battery * EFFICIENCY) / avgCurrent;
-  const totalCyclesActual = Math.floor(totalHoursActual * 3600 / tCycleCurrent);
-  const totalHoursTarget = totalHoursActual * tCycleTarget / tCycleCurrent;
-  const sampleEnergy = avgPower * tCycleCurrent / 3600; // mWh
-  const sampleEnergyText = sampleEnergy >= 1
-    ? `${sampleEnergy.toFixed(3)} mWh`
-    : `${(sampleEnergy * 1000).toFixed(2)} μWh`;
+  const avgRunCurrent = data.reduce((s, d) => s + Math.abs(d.current), 0) / n;  // mA
+  const avgRunPower   = avgRunCurrent * VOLTAGE;  // mW
+  document.getElementById('r-avg-display').textContent = `${avgRunCurrent.toFixed(3)} mA`;
+  document.getElementById('r-avg-power').innerHTML = `${avgRunPower.toFixed(2)}<span>mW</span>`;
 
-  document.getElementById('r-avg-display').textContent = `${avgCurrent.toFixed(3)} mA`;
-  document.getElementById('r-avg-power').innerHTML = `${avgPower.toFixed(2)}<span>mW</span>`;
-  document.getElementById('r-avg-current-sub').textContent = `均值 ${avgCurrent.toFixed(3)} mA · ${n} 个采样点`;
-  document.getElementById('r-sample-power').innerHTML = sampleEnergyText;
+  if (!cycleMetrics) {
+    return;
+  }
+
+  document.getElementById('r-sample-power').innerHTML = cycleMetrics.singleCycleEnergy >= 1
+    ? `${cycleMetrics.singleCycleEnergy.toFixed(3)} mWh`
+    : `${(cycleMetrics.singleCycleEnergy * 1000).toFixed(2)} μWh`;
   document.getElementById('r-sample-power-sub').textContent = `当前周期 ${tCycleCurrent}s 单次采集能耗`;
-
-  document.getElementById('r-total-cycles').innerHTML = `${totalCyclesActual.toLocaleString()}<span>次</span>`;
+  document.getElementById('r-sample-active-time').innerHTML = `${cycleMetrics.activeTime.toFixed(2)}<span>s</span>`;
+  document.getElementById('r-sample-duration-sub').textContent = `周期内电流≥${SAMPLING_CURRENT_THRESHOLD}mA 时长`;
+  document.getElementById('r-total-cycles').innerHTML = `${cycleMetrics.currentSupportCount.toLocaleString()}<span>次</span>`;
   document.getElementById('r-cycles-sub').textContent =
-    `当前周期 ${tCycleCurrent}s · 总采样次数`;
-
-  document.getElementById('r-target-life').innerHTML = formatBatteryLife(totalHoursTarget);
+    `当前周期 ${tCycleCurrent}s · 支持 ${cycleMetrics.currentSupportCount.toLocaleString()} 次`;
+  document.getElementById('r-target-life').innerHTML = formatBatteryLife(cycleMetrics.totalTargetHours);
   document.getElementById('r-target-sub').textContent =
-    `目标周期 ${tCycleTarget}s · 对应续航 ${totalCyclesActual.toLocaleString()} 次`;
+    `目标周期 ${tCycleTarget}s · 对应 ${cycleMetrics.totalTargetHours.toFixed(1)} 小时`;
 }
 
 // 参数变化时重算
 ['battery', 't-cycle-target'].forEach(id => {
-  document.getElementById(id).addEventListener('input', calcBattery);
+  document.getElementById(id).addEventListener('input', () => calcBattery(cycleMetrics));
 });
 document.getElementById('t-cycle-current').addEventListener('input', () => {
-  calcBattery();
+  resetCycleStats();
+  calcBattery(cycleMetrics);
   updateChart();
 });
 
 // ── WebSocket ──────────────────────────────────────────────────────────────
 function connect() {
   ws = new WebSocket(WS_URL);
+  
   ws.onopen = () => {
+    console.log('[WebSocket] ✓ 已连接');
     document.getElementById('status-dot').className = '';
     document.getElementById('status-text').textContent = '已连接 · KV-AMP700mT';
   };
+  
   ws.onmessage = (e) => {
-    const pt = JSON.parse(e.data);
-    data.push(pt);
-    if (data.length > MAX_POINTS) data.shift();
-    updateMetrics(pt);
-    updateChart();
+    try {
+      const pt = JSON.parse(e.data);
+      data.push(pt);
+      if (data.length > MAX_POINTS) data.shift();
+      updateMetrics(pt);
+      updateChart();
+    } catch (err) {
+      console.error('[WebSocket] 数据解析错误:', err);
+    }
   };
+  
   ws.onclose = () => {
+    console.warn('[WebSocket] 连接已断开');
     document.getElementById('status-dot').className = 'disconnected';
     document.getElementById('status-text').textContent = '断开 · 5s后重连...';
     setTimeout(connect, 5000);
   };
-  ws.onerror = () => ws.close();
+  
+  ws.onerror = (err) => {
+    console.error('[WebSocket] 连接错误:', err);
+    document.getElementById('status-dot').className = 'disconnected';
+    document.getElementById('status-text').textContent = '❌ 连接失败 · 检查服务器';
+    // 显示更详细的错误提示
+    const hint = document.createElement('div');
+    hint.style.cssText = 'position:fixed;top:20px;right:20px;background:#f85149;color:#fff;padding:12px 16px;border-radius:8px;font-size:12px;z-index:9999;max-width:300px;';
+    hint.innerHTML = `
+      <div style="font-weight:bold;margin-bottom:8px;">⚠️ WebSocket 连接失败</div>
+      <div style="margin-bottom:4px;">检查清单:</div>
+      <div>1. Python 服务器是否启动?</div>
+      <div>2. 运行: <code style="background:#000;padding:2px 4px;border-radius:3px;">python3 power_monitor.py</code></div>
+      <div style="margin-top:8px;font-size:11px;color:#ddd;">若无硬件，运行: <code style="background:#000;padding:2px 4px;">DEBUG=1 python3 power_monitor.py</code></div>
+    `;
+    document.body.appendChild(hint);
+    setTimeout(() => hint.remove(), 8000);
+    ws.close();
+  };
 }
 
 function clearData() {
   data = [];
+  cycleData = [];
+  cycleMetrics = null;
   peakCurrent = 0;
   valleyCurrent = Number.POSITIVE_INFINITY;
   document.getElementById('val-peak').innerHTML = `--<span>mA</span>`;
@@ -468,6 +624,7 @@ function clearData() {
   chartCurrent.data.datasets[0].data = [];
   chartCurrent.data.datasets[1].data = [];
   chartCurrent.update();
+  resetCycleStats();
 }
 
 function resetPeak() {

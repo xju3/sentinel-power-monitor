@@ -11,6 +11,8 @@ import struct
 import time
 import serial
 import websockets
+import sys
+import os
 
 # ── 配置 ──────────────────────────────────────────
 SERIAL_PORT   = '/dev/cu.usbmodem5B7A0302631'
@@ -19,6 +21,7 @@ INTERVAL_MS   = 200       # 采样间隔 ms
 VOLTAGE       = 3.3       # ESP32-S3 供电电压 V
 WS_HOST       = '0.0.0.0'
 WS_PORT       = 8765
+DEBUG_MODE    = os.getenv('DEBUG') == '1'  # 调试模式：模拟数据
 # ──────────────────────────────────────────────────
 
 MODBUS_CMD = bytes([0x01, 0x03, 0x00, 0x00, 0x00, 0x02])
@@ -58,6 +61,11 @@ async def ws_handler(ws):
         print(f"[WS] 客户端断开: {ws.remote_address}")
 
 async def serial_reader():
+    if DEBUG_MODE:
+        print("[DEBUG] 调试模式启用 - 使用模拟数据")
+        await debug_reader()
+        return
+    
     print(f"[串口] 打开 {SERIAL_PORT} @ {BAUD_RATE}baud")
     try:
         ser = serial.Serial(
@@ -68,35 +76,87 @@ async def serial_reader():
         )
     except serial.SerialException as e:
         print(f"[错误] 串口打开失败: {e}")
+        print(f"[提示] 可用串口: {serial.tools.list_ports.comports()}")
+        print(f"[提示] 使用调试模式: DEBUG=1 python3 power_monitor.py")
         return
 
     print(f"[串口] 已连接，开始采样（{INTERVAL_MS}ms/次）")
     interval = INTERVAL_MS / 1000
+    read_errors = 0
 
     while True:
         t_start = time.monotonic()
-        current_ma = read_current_ma(ser)
+        try:
+            current_ma = read_current_ma(ser)
 
-        if current_ma is not None:
-            power_mw = abs(current_ma) * VOLTAGE
-            payload = json.dumps({
-                "ts":        round(time.time() * 1000),   # ms 时间戳
-                "current":   round(current_ma, 3),         # mA
-                "power":     round(power_mw, 3),           # mW
-                "voltage":   VOLTAGE,
-            })
-            await broadcast(payload)
-        else:
-            print("[警告] 读取超时或响应异常")
+            if current_ma is not None:
+                power_mw = abs(current_ma) * VOLTAGE
+                payload = json.dumps({
+                    "ts":        round(time.time() * 1000),   # ms 时间戳
+                    "current":   round(current_ma, 3),         # mA
+                    "power":     round(power_mw, 3),           # mW
+                    "voltage":   VOLTAGE,
+                })
+                await broadcast(payload)
+                read_errors = 0
+            else:
+                read_errors += 1
+                if read_errors % 10 == 0:
+                    print(f"[警告] 读取超时（{read_errors}次）")
+        except Exception as e:
+            print(f"[错误] {e}")
+            await asyncio.sleep(1)
+            continue
 
         elapsed = time.monotonic() - t_start
         await asyncio.sleep(max(0, interval - elapsed))
 
+async def debug_reader():
+    """调试模式 - 生成模拟数据"""
+    print("[DEBUG] 生成模拟功耗数据，建议用于测试 WebSocket 连接")
+    interval = INTERVAL_MS / 1000
+    import random
+    phase = 0
+    
+    while True:
+        t_start = time.monotonic()
+        # 生成模拟数据：基础 50mA + 正弦波纹波
+        phase = (phase + 0.1) % (2 * 3.14159)
+        base_current = 50
+        ripple = 20 * (1 + __import__('math').sin(phase))
+        current_ma = base_current + ripple + random.gauss(0, 2)
+        
+        power_mw = abs(current_ma) * VOLTAGE
+        payload = json.dumps({
+            "ts":        round(time.time() * 1000),
+            "current":   round(current_ma, 3),
+            "power":     round(power_mw, 3),
+            "voltage":   VOLTAGE,
+        })
+        await broadcast(payload)
+        
+        elapsed = time.monotonic() - t_start
+        await asyncio.sleep(max(0, interval - elapsed))
+
 async def main():
+    print(f"\n{'='*60}")
     print(f"[服务] WebSocket 启动于 ws://localhost:{WS_PORT}")
-    print(f"[服务] 用浏览器打开 power_monitor.html 即可查看曲线")
-    async with websockets.serve(ws_handler, WS_HOST, WS_PORT):
-        await serial_reader()
+    print(f"[服务] 用浏览器打开 http://localhost:8000")
+    print(f"{'='*60}\n")
+    
+    try:
+        async with websockets.serve(ws_handler, WS_HOST, WS_PORT):
+            await serial_reader()
+    except KeyboardInterrupt:
+        print("\n[停止] 服务已关闭")
+    except Exception as e:
+        print(f"\n[错误] {e}")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    if DEBUG_MODE:
+        print("\n[启动] 调试模式")
+    asyncio.run(main())
 
 if __name__ == '__main__':
     asyncio.run(main())
