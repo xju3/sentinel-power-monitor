@@ -8,13 +8,14 @@ import sys
 import os
 import subprocess
 
+
 def start_server():
     """启动 WebSocket 服务器"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     server_script = os.path.join(script_dir, 'power_monitor.py')
     
     print("\n" + "="*60)
-    print("⚡ ESP32-S3 功耗监控服务")
+    print("⚡ KV-AMP700mT 功耗监控服务")
     print("="*60)
     print("\n启动选项:")
     print("  [1] 实时监控 (需要硬件连接)")
@@ -26,12 +27,14 @@ def start_server():
     if choice == '1':
         print("\n[启动] 实时监控模式...")
         print("[提示] 确保 KV-AMP700mT 已通过 USB 连接\n")
-        os.system(f'python3 {server_script}')
+        # 使用 subprocess.run 替代 os.system，更加健壮
+        subprocess.run([sys.executable, server_script])
     elif choice == '2':
         print("\n[启动] 调试模式（模拟数据）...\n")
         env = os.environ.copy()
         env['DEBUG'] = '1'
-        os.system(f'DEBUG=1 python3 {server_script}')
+        # 使用 subprocess.run 并传递 env 字典，实现跨平台
+        subprocess.run([sys.executable, server_script], env=env)
     elif choice == '3':
         print("[退出]\n")
         sys.exit(0)

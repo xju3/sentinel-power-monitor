@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 KV-AMP700mT 实时功耗监控服务
-ESP32-S3 @ 3.3V
 用法: python3 power_monitor_server.py
 """
 
@@ -10,21 +9,24 @@ import json
 import struct
 import time
 import serial
+import serial.tools.list_ports
 import websockets
 import sys
 import os
 
 # ── 配置 ──────────────────────────────────────────
-SERIAL_PORT   = '/dev/cu.usbmodem5B7A0302631'
+# !! 检查并修改以下配置以匹配你的设备 !!
+SERIAL_PORT   = None      # 串口号。设为 None 可自动检测 (推荐)
+                          # Windows 示例: 'COM3'
+                          # macOS / Linux 示例: '/dev/tty.usbmodem12345'
 BAUD_RATE     = 9600
-INTERVAL_MS   = 200       # 采样间隔 ms
-VOLTAGE       = 3.3       # ESP32-S3 供电电压 V
+MODBUS_SLAVE_ID = 1       # Modbus 从机地址，请参考设备手册
+INTERVAL_MS   = 200       # 采样间隔 ms (建议放宽到500ms，避免RS485拥塞)
+VOLTAGE       = 3.3       # 系统供电电压 V
 WS_HOST       = '0.0.0.0'
 WS_PORT       = 8765
 DEBUG_MODE    = os.getenv('DEBUG') == '1'  # 调试模式：模拟数据
 # ──────────────────────────────────────────────────
-
-MODBUS_CMD = bytes([0x01, 0x03, 0x00, 0x00, 0x00, 0x02])
 
 def crc16(data: bytes) -> bytes:
     crc = 0xFFFF
@@ -35,11 +37,21 @@ def crc16(data: bytes) -> bytes:
     return struct.pack('<H', crc)
 
 def read_current_ma(ser: serial.Serial) -> float | None:
-    cmd = MODBUS_CMD + crc16(MODBUS_CMD)
+    # Modbus RTU 查询帧: [从机地址, 功能码, 寄存器起始地址 (2B), 读取寄存器数量 (2B), CRC校验 (2B)]
+    # 读取 2 个保持寄存器 (从地址 0x0000 开始)
+    pdu = bytes([0x03, 0x00, 0x00, 0x00, 0x02]) # PDU: 功能码(0x03) + 数据
+    adu = bytes([MODBUS_SLAVE_ID]) + pdu         # ADU: 从机地址 + PDU
+    cmd = adu + crc16(adu)
     ser.reset_input_buffer()
+    ser.reset_output_buffer() # 确保发送缓冲区没有残留脏数据
     ser.write(cmd)
+    ser.flush()
     resp = ser.read(9)
     if len(resp) != 9:
+        if len(resp) > 0:
+            print(f"[警告] 数据长度异常, 收到 {len(resp)} 字节: {resp.hex()}")
+        else:
+            print("[警告] 未收到任何数据")
         return None
     raw = struct.unpack('>i', resp[3:7])[0]
     return raw * 10 / 1000   # 分辨率 10uA → mA
@@ -66,19 +78,41 @@ async def serial_reader():
         await debug_reader()
         return
     
-    print(f"[串口] 打开 {SERIAL_PORT} @ {BAUD_RATE}baud")
+    port_to_use = SERIAL_PORT
+    if not port_to_use:
+        print("[串口] 正在自动检测串口...")
+        ports = serial.tools.list_ports.comports()
+        # 优先选择包含 'usb' 或 'acm' 的设备，这是常见 USB 串口的标识
+        candidates = [p for p in ports if 'usb' in p.device.lower() or 'acm' in p.device.lower()]
+        
+        if not candidates:
+            print(f"[错误] 未找到可用的 USB 串口。检测到所有串口: {[p.device for p in ports]}")
+            print(f"[提示] 请在脚本顶部手动配置 'SERIAL_PORT'。")
+            return
+        
+        if len(candidates) > 1:
+            print(f"[警告] 检测到多个可能的串口: {[p.device for p in candidates]}")
+        
+        port_to_use = candidates[0].device
+        print(f"[串口] 自动选择端口: {port_to_use}")
+
+    print(f"[串口] 尝试打开 {port_to_use} @ {BAUD_RATE}baud (从机地址: {MODBUS_SLAVE_ID})")
     try:
         ser = serial.Serial(
-            port=SERIAL_PORT,
+            port=port_to_use,
             baudrate=BAUD_RATE,
             bytesize=8, parity='N', stopbits=1,
             timeout=0.5
         )
     except serial.SerialException as e:
         print(f"[错误] 串口打开失败: {e}")
-        print(f"[提示] 可用串口: {serial.tools.list_ports.comports()}")
+        print(f"[提示] 确认设备已连接，且端口 '{port_to_use}' 未被其他程序占用。")
         print(f"[提示] 使用调试模式: DEBUG=1 python3 power_monitor.py")
         return
+
+    print("[串口] 等待设备启动 (2秒)...")
+    await asyncio.sleep(2)
+    ser.reset_input_buffer()
 
     print(f"[串口] 已连接，开始采样（{INTERVAL_MS}ms/次）")
     interval = INTERVAL_MS / 1000
@@ -101,8 +135,7 @@ async def serial_reader():
                 read_errors = 0
             else:
                 read_errors += 1
-                if read_errors % 10 == 0:
-                    print(f"[警告] 读取超时（{read_errors}次）")
+                await asyncio.sleep(0.5) 
         except Exception as e:
             print(f"[错误] {e}")
             await asyncio.sleep(1)
@@ -156,7 +189,4 @@ async def main():
 if __name__ == '__main__':
     if DEBUG_MODE:
         print("\n[启动] 调试模式")
-    asyncio.run(main())
-
-if __name__ == '__main__':
     asyncio.run(main())
