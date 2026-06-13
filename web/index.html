@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32-S3 功耗监控</title>
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+
+<header>
+  <h1>⚡ ESP32-S3 · 功耗监控 · 3.3V</h1>
+  <div>
+    <span id="status-dot" class="disconnected"></span>
+    <span id="status-text">连接中...</span>
+  </div>
+</header>
+<main>
+
+<div class="workflow-panel">
+  <p class="section-label">设备监测流程</p>
+  <div class="workflow-actions">
+    <button id="mode-monitor" onclick="selectWorkflow('monitor')">1. 监测某个设备功耗</button>
+    <button id="mode-query" onclick="selectWorkflow('query')">2. 查询某个设备功耗数据</button>
+    <span id="workflow-status" style="font-size:12px; color:#7d8590;">请选择入口</span>
+  </div>
+</div>
+
+<div id="monitor-workflow" class="hidden">
+<!-- 实时指标 -->
+<p class="section-label">实时测量</p>
+<div class="metrics">
+         <div class="metric">
+    <div class="metric-label">峰值电流</div>
+    <div class="metric-value purple" id="val-peak">--<span>mA</span></div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">谷值电流</div>
+    <div class="metric-value purple" id="val-valley">--<span>mA</span></div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">当前电流</div>
+    <div class="metric-value purple" id="val-current">--<span>mA</span></div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">当前能耗</div>
+    <div class="metric-value amber" id="val-power">--<span>mW</span></div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">平均能耗</div>
+    <div class="metric-value amber" id="r-avg-power">--<span>mW</span></div>
+  </div>
+  <div class="metric">
+    <div class="metric-label">总能耗</div>
+    <div class="metric-value amber" id="val-total-energy">--<span>mWh</span></div>
+  </div>
+ 
+</div>
+
+<!-- 曲线 -->
+<div class="chart-wrap">
+  <p class="section-label">电流曲线 (mA)</p>
+  <div style="position:relative;width:100%;height:100%;min-height:260px;">
+    <canvas id="chart-current" role="img" aria-label="实时电流曲线">实时电流</canvas>
+  </div>
+</div>
+
+<!-- 续航估算 -->
+<div class="calculator">
+  <p class="section-label">续航估算</p>
+
+  <div style="display:flex; gap:12px; align-items:flex-end; margin-bottom:16px; flex-wrap:wrap;">
+    <div class="input-group" style="margin:0;">
+      <label>设备编号</label>
+      <div class="input-row">
+        <input type="text" id="device-id" placeholder="例如 SN-001" autocomplete="off">
+      </div>
+    </div>
+    <div class="input-group" style="margin:0;">
+      <label>电池容量</label>
+      <div class="input-row">
+        <input type="number" id="battery" value="19000" step="100" min="100">
+        <span class="unit">mAh</span>
+      </div>
+    </div>
+    <div class="input-group" style="margin:0;">
+      <label>当前采集周期</label>
+      <div class="input-row">
+        <input type="number" id="t-cycle-current" value="60" step="1" min="1">
+        <span class="unit">秒</span>
+      </div>
+    </div>
+    <div class="input-group" style="margin:0;">
+      <label>目标采集周期</label>
+      <div class="input-row">
+        <input type="number" id="t-cycle-target" value="3600" step="60" min="1">
+        <span class="unit">秒</span>
+      </div>
+    </div>
+    <div style="font-size:11px; color:#7d8590; padding-bottom:8px; line-height:1.6;">
+      电流来自全程实测均值<br>放电效率 85%
+    </div>
+    <button onclick="startMonitoring()" id="start-monitor-btn">开始监测</button>
+    <button onclick="stopMonitoring()">停止监测</button>
+    <span id="monitor-start-status" style="font-size:12px; color:#7d8590; padding-bottom:8px;">请输入设备编号后开始</span>
+  </div>
+
+  <!-- 实测均值状态 -->
+  <div style="background:#0d1117; border:0.5px solid #30363d; border-radius:6px; padding:10px 14px; margin-bottom:16px; font-size:12px; color:#7d8590;">
+    全程实测均值：<span id="r-avg-display" style="color:#e3b341; font-size:14px; font-variant-numeric:tabular-nums;">等待数据...</span>
+    <span style="margin-left:16px;">已采样：<span id="r-sample-count" style="color:#7d8590;">0</span> 个点
+    （<span id="r-sample-duration">0</span> 秒）</span>
+    <span style="margin-left:16px; color:#7d8590; font-size:11px;">建议跑满至少一个完整周期后再看结果</span>
+  </div>
+
+  <hr class="divider">
+
+  <div class="result-grid">
+    <div class="result-card">
+      <div class="r-label" id="r-label-cycle-avg">平均周期电流</div>
+      <div class="r-value blue" id="r-cycle-avg-current">--<span>mA</span></div>
+      <div class="r-sub">完整周期统计</div>
+    </div>
+    <div class="result-card">
+      <div class="r-label" id="r-label-sample-power">平均单次能耗</div>
+      <div class="r-value amber" id="r-sample-power">--<span>mWh</span></div>
+      <div class="r-sub" id="r-sample-power-sub">--</div>
+    </div>
+    <div class="result-card">
+      <div class="r-label" id="r-label-sample-time">平均活跃时长</div>
+      <div class="r-value blue" id="r-sample-active-time">--<span>s</span></div>
+      <div class="r-sub" id="r-sample-duration-sub">--</div>
+    </div>
+    <div class="result-card">
+      <div class="r-label" id="r-label-total-cycles">平均支持次数</div>
+      <div class="r-value blue" id="r-total-cycles">--<span>次</span></div>
+      <div class="r-sub" id="r-cycles-sub">--</div>
+    </div>
+    <div class="result-card">
+      <div class="r-label" id="r-label-target-life">平均预估续航</div>
+      <div class="r-value green" id="r-target-life">--</div>
+      <div class="r-sub" id="r-target-sub">--</div>
+    </div>
+  </div>
+</div>
+<div class="controls">
+  <label class="ctrl" for="window-cycles">显示窗口</label>
+  <div class="input-row" style="align-items:center; gap:8px;">
+    <input type="number" id="window-cycles" value="1" step="1" min="1" style="width:80px;">
+    <span class="unit">采集周期</span>
+  </div>
+  <button onclick="toggleFullScreen()" id="fs-btn">全屏</button>
+  <button onclick="clearData()">清空</button>
+  <button onclick="exportCSV()">导出 CSV</button>
+  <button class="danger" onclick="resetPeak()">重置峰值</button>
+</div>
+</div>
+
+<!-- 设备续航查询 -->
+<div id="query-workflow" class="query-panel hidden">
+  <p class="section-label">设备续航查询</p>
+  <div class="query-bar">
+    <div class="input-group" style="margin:0;">
+      <label>查询设备编号</label>
+      <div class="input-row">
+        <input type="text" id="query-device-id" placeholder="例如 SN-001" autocomplete="off" style="width:160px;">
+      </div>
+    </div>
+    <button onclick="queryDeviceLife()">查询</button>
+    <span id="life-query-status" style="font-size:12px; color:#7d8590;">请输入设备编号查询续航评估</span>
+  </div>
+  <div class="life-table-wrap">
+    <table class="life-table">
+      <thead>
+        <tr>
+          <th>设备编号</th>
+          <th>最后记录</th>
+          <th>采样时长</th>
+          <th>平均电流</th>
+          <th>单次能耗</th>
+          <th>支持次数</th>
+          <th>预估续航</th>
+        </tr>
+      </thead>
+      <tbody id="life-query-body">
+        <tr><td colspan="7" class="muted">暂无查询结果</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>
